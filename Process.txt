@@ -1,0 +1,378 @@
+1.  Installed docker
+
+2.  Created YML file to get all the images of applications we gonna run inside docker
+        1. Postgres
+        2. Apache spark hive
+        3. Apache spark master
+        4. Apache spark worker
+        5. Apache kafka
+        6. Apache kafka ui
+
+3.  Setup hive-conf folder in IDE and in it configure hive-site.xml file as per the volume section in apache hive's \
+    YML section
+
+4.  We then run this docker YML file through powershell "docker compose up -d" which first pulls each image and \
+    installs it in our container, then starting every image's instance on our container named traffic_de, which we had \
+    given while creating project directory
+
+5.  Now using this cmd
+    "docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --create --topic traffic-topic --bootstrap-server kafka:9092
+    --partitions 3 --replication-factor 1"
+
+    We create our kafka topic name 'traffic-topic'
+
+    A topic in kafka is simply a space where producer feeds data, feeds data means it is a live stream data so \
+    producer/source is constantly streaming data into topic in raw format mostly json
+
+6.  After creating topic, we now need to setup Producer which will stream data into our topic 'traffic-topic'. We \
+    create a folder in our IDE 'Producer' under which our python script 'traffic_dirty_producer' to produce continuous \
+    data stream will be there.
+
+    This script will contain code which will generate data/livestream continuously using while loop until stopped
+
+7.  Now in powershell enter cmd "py traffic_dirty_producer.py" to generate live stream data.
+
+    As long as its running data will keep on generating until its stopped using 'ctrl+C'. Then the no of msgs/feed \
+    will be displayed on our apache UI webpage
+
+    Kafka holds this data till its retention window, and before it expires or retention window closes, we have to \
+    move this data to bronze layer
+
+8.  Next step is using spark to pull data from kafka and store it in bronze layer, we have to assign schema to it and \
+    save it in bronze layer as delta table
+
+    Bronze layer is just use to store raw data and assign a schema to it, no transformations are done in this stage.
+
+    We store raw data here because if in case data gets deleted from kafka, it serves as a backup
+
+    Now source is done, we move ahead in our medallion architecture
+
+9.  We create a new py file (for bronze layer operation) into apps folder, the app folder is already created through \
+    YML file and is mounted to spark worker and master containers
+
+10. Now after creating bronze layer python file 'traffic_bronze.py' we run below command to execute and write bronze \
+    data in delta format
+
+    "docker exec -it spark-worker /opt/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/.ivy --packages
+    io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 /opt/spark-apps/traffic_bronze.py"
+
+    This cmd will execute spark worker container, download some packages such as delta-spark, because we gonna use \
+    delta table to write into
+
+11. Now as soon as we run this cmd, the data which is already there in kafka offset will start to write through all \
+    the processing done in 'traffic_bronze.py' file
+
+    It will create two files for same data each, one .crc and another .parquet
+    .crc is for security purposes which is not of use to us
+    .parquet basically contains usable data
+
+12. Now executing data generating cmd (py traffic_dirty_producer.py) again, in a new powershell, data starts to get \
+    streamed again.
+
+    Our previous cmd is still on hold, one which starts spark worker container and writes to delta table through \
+    traffic_bronze.py waiting to get new streaming data
+
+    As soon as data starts to stream/generate again the spark worker cmd starts processing that stream from last \
+    offset stored and continues to write to delta table in bronze layer, it basically appends any new streamed data \
+    from the point where last offset was processed.
+
+13. Now open spark master, we can see in running application 'TrafficStreamingLakehouse' is there, which we \
+    initialized earlier in spark session config
+
+    Once we terminate spark worker cmd in powershell, of writing/processing data to delta table in bronze layer, this \
+    moves from 'running application' to 'completed application' and worker's core & memory usage comes to zero, that \
+    means this worker is now ready to handle another task, earlier it was busy processing data to delta table in \
+    bronze layer.
+
+    At a time only one process can be triggered as there is only one worker, so we can do like this
+    Generate Data/stream then either
+        1. spark worker processing bronze layer, or
+        2. spark worker processing silver layer, or
+        3. spark worker processing gold layer
+    Generating data/stream and bronze processing can be done at same time as generating stream is not part of any \
+    container and to run all 3 processes at same time then we need to have total 3 spark workers so that they can \
+    handle each task in parallel.
+
+14. First create spark session using application name "TrafficStreamingLakehouse"
+
+    Then read data from kafka topic 'traffic-topic'
+
+    Then in bronze layer we basically first convert our binary json into string format, \
+    add timestamp column as kafka_timestamp
+
+    Then define schema in a flexible way, where we process datatypes as per their initial values, for eg, speed \
+    we given string datatype, because it will also have faulty data which is a string, later on we can convert it using \
+    flags and all in silver layer
+
+    Parsed - where we include 3rd column which is basically schema as a whole as one value
+
+    Flattened - We flatten the 3rd column i.e. whole schema is split into its respective columns i.e. vehicle_id, \
+    road_id, city_zone etc
+
+    Then write data into bronze layer in delta format
+
+    Data is stored in /warehouse/traffic_bronze
+
+----------------------------------------------------SILVER-LAYER--------------------------------------------------------
+
+15. Before moving onto making transformations for silver layer we first write down all of our columns into a text file \
+    and try to also consider what errors we can face during cleaning
+
+    In silver layer mostly cleaning is done
+
+16. Same procedure
+        Create spark session with an application name "TrafficSilverLayer"
+        Read data from bronze layer 'traffic_bronze'
+        Do some cleaning, create some flags, filter records, handle late data with withWatermark function, dedup, \
+        Business logics
+        Atlast write data into silver layer in delta format
+
+17. After writing code for silver layer, we then trigger it using below command
+
+    "docker exec -it spark-worker /opt/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/.ivy --packages
+    io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 /opt/spark-apps/traffic_silver.py"
+
+    Data is stored in /warehouse/traffic_silver
+
+-------------------------------------------------GOLD-LAYER-------------------------------------------------------------
+
+18. In gold layer we create fact and dimension tables
+
+19. Same procedure
+        Create spark session using application name "TrafficGoldLayer"
+        Read data from silver layer 'traffic_silver'
+        Create Dimension table dim_zone
+        Create Dimension table dim_road
+        Create fact table fact_stream
+        Write data into gold layer in delta format
+
+20. After writing code for gold layer, we then trigger it using below command
+
+    "docker exec -it spark-worker /opt/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/.ivy --packages
+    io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 /opt/spark-apps/traffic_silver.py"
+
+    Data is stored in
+        /warehouse/dim_road
+        /warehouse/dim_zone
+        /warehouse/fact_traffic
+    for dimension and fact tables
+
+21. After working on all 3 layers, we now work on passing our tables data to powerbi to gather insights
+
+22. Firstly we will run this cmd
+
+    "docker exec -it spark-worker bash"
+
+    This will help us execute bash commands in spark-worker container, executing this will open folder inside spark-worker \
+    container where we can run bash cmds, and whatever we do there will reflect in spar-worker directories
+
+23. Run cmd
+
+    "mkdir -p /tmp/spark-warehouse"
+
+    This will create a directory inside spark-worker where we can store our all tables metadata like not actual data \
+    but schema and all the information related to skeleton of tables
+
+    Then this cmd
+
+    "chmod -R 777 /tmp/spark-warehouse"
+
+    This will give all permissions to all files inside above folder
+
+---------------------CREATE TABLES THROUGH SQL CONNECTION ON HIVE-METASTORE---------------------------------------------
+
+24. Now we need to establish connection to spark-SQL on hivemeta-metastore SQL database, \
+    to do this we need to run below cmd
+
+    /opt/spark/bin/spark-sql \
+    # In above line we navigate to spark-sql inside the container and create a sql connection to write SQL queries
+    --packages io.delta:delta-spark_2.12:3.2.0 \
+    # We used Delta Lake open source tool for our storage, so we get delta-spark package to install
+    --conf spark.jars.ivy=/tmp/.ivy \
+    # The delta-spark package will be installed in above path spark-ivy and into jars folder
+    --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+    --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+    --conf spark.sql.catalogImplementation=hive \
+    --conf spark.hadoop.hive.metastore.uris=thrift://hive-metastore:9083 \
+    # Above 4 lines have packages and configurations for hive metastore to create the tables, to get data from \
+    # delta tables and establish the connection
+    --conf spark.sql.warehouse.dir=/tmp/spark-warehouse
+    # Above line is just to establish connection between directory '/tmp/spark-warehouse' that we created and sql meta-\
+    # terminal so that we can run below, the SQL commands from this terminal into our '/tmp/spark-warehouse' where our \
+    # table's metadata is stored
+    # This is the reason when using 'USING DELTA' sql code we can execute it here w/o any errors
+
+25. After running this cmd we are into hive metastore's SQL terminal where we can run SQL commands to create fact and \
+    dimension tables
+
+    So first create database
+    "CREATE DATABASE traffic_de;"
+
+    Then we need to select that database for further querying
+    "USE traffic_de;"
+
+26. After creating traffic_de DB, we need to create our fact and dimension tables in it.
+    First to create fact table-
+
+    "CREATE TABLE fact_traffic
+     USING DELTA
+     LOCATION '/opt/spark/warehouse/fact_traffic';"
+
+     This will create our fact table, using DELTA table format through which we have installed all the packages above \
+     and from the provided location it gets the metadata of fact table like schema
+
+27. Table gets created and just to check if its created we run this query
+
+    "SELECT COUNT(*) FROM fact_traffic;"
+
+    This will return us the amt of rows in that table
+
+28. Now to create our dimension tables- We run below query
+
+    "CREATE TABLE dim_zone
+     USING DELTA
+     LOCATION '/opt/spark/warehouse/dim_zone';"
+
+29. This will create dim_zone/dim_road dimension tables, so to check them as well we run count queries on them
+
+    "SELECT COUNT(*) FROM dim_zone;"
+    "SELECT COUNT(*) FROM dim_zone;"
+
+    for dim_zone it will return 5 rows because it has 5 types 'CBD, AIRPORT, TRAINSTATION, TECHPARK, SUBURB'
+    for dim_road it will return 4 rows because it has 4 type of roads 'R100, R200, R300, R400'
+
+30. Now we gonna create a view so that we can show that view directly into power-bi, but we not just gonna create a \
+    view but to have a final check on it we will cast it to their appropriate data types even if we have already cast \
+    correct datatypes, so that if its right already, then nothing happens or else if its incorrect earlier, we get \
+    corrected datatype for analysing data from that table and do any arithmetic operations on them if they suppose to \
+    be int
+
+    We created views to work into power-bi, we can analyze on those views only, we cannot analyze on direct tables
+
+31. So the query for view for fact_traffic table is
+
+    "CREATE OR REPLACE VIEW bi_fact_traffic AS
+     SELECT
+     CAST(vehicle_id AS STRING) AS vehicle_id,
+     CAST(road_id AS STRING) AS road_id,
+     CAST(city_zone AS STRING) AS city_zone,
+     CAST(speed_int AS DOUBLE) AS speed,
+     CAST(congestion_level AS INT) AS congestion_level,
+     CAST(event_ts AS TIMESTAMP) AS event_time,
+     CAST(peak_flag AS STRING) AS peak_flag,
+     CAST(speed_band AS STRING) AS speed_band,
+     CAST(weather AS STRING) AS weather,
+     CAST(date AS DATE) AS event_date,
+     CAST(hour AS INT) AS event_hour
+     FROM fact_traffic;"
+
+32. Same to create views for dim tables as well
+
+    For dim_zone
+
+    "CREATE OR REPLACE VIEW bi_dim_zone AS
+     SELECT
+     CAST(city_zone AS STRING) AS city_zone,
+     CAST(zone_type AS STRING) AS zone_type,
+     CAST(traffic_risk AS STRING) AS traffic_risk
+     FROM dim_zone;"
+
+    For dim_road
+
+    "CREATE OR REPLACE VIEW bi_dim_road AS
+     SELECT
+     CAST(road_id AS STRING) AS road_id,
+     CAST(road_type AS STRING) AS road_type,
+     CAST(speed_limit AS INT) AS speed_limit
+     FROM dim_road;"
+
+------------------------------------------HIVE-METASTORE----------------------------------------------------------------
+
+33. Now to establish thrift server that is connected to metastore database, \
+    then we connect this thrift server to power-bi
+
+    For establishing this thrift server connection we need to download some jars first
+
+34. To do above procedure first exit SQL terminal connection from powershell using below cmd
+
+    "exit;"
+
+    It will then return to '/opt/spark/work-dir' in spark-worker directory
+    "spark@spark-worker:/opt/spark/work-dir$"
+
+    Then change directory using below cmd
+
+    "cd /opt/spark/jars"
+
+    This will change directory to above path
+    "spark@spark-worker:/opt/spark/jars$"
+
+35. Now to download jars into this path run both below cmds
+
+    "wget https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.2.0/delta-spark_2.12-3.2.0.jar"
+    "wget https://repo1.maven.org/maven2/io/delta/delta-storage/3.2.0/delta-storage-3.2.0.jar"
+
+    It will download jars from first cmd then move to second cmd, press enter to download 2nd cmd jars
+
+36. Now need to download packages and configs to establish thrift server for hive metastore
+    For that run below cmd
+
+    "/opt/spark/sbin/start-thriftserver.sh \
+    --master spark://spark-master:7077 \
+    --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+    --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+    --conf spark.sql.catalogImplementation=hive \
+    --conf spark.hadoop.hive.metastore.uris=thrift://hive-metastore:9083 \
+    --conf spark.sql.warehouse.dir=/opt/spark/warehouse"
+
+    To check whether we established hive server correctly, check for this line in powershell
+
+    "starting org.apache.spark.sql.hive.thriftserver.HiveThriftServer2, logging
+    to /opt/spark/logs/spark--org.apache.spark.sql.hive.thriftserver.HiveThriftServer2-1-spark-worker.out"
+
+------------------------------------CONFIGURING POWER-BI----------------------------------------------------------------
+
+37. To import data into power-bi, in homepage click get "data from another source"
+
+38. In Get Data page, search for spark and click connect
+
+39. In Spark select below options:
+
+    Server - localhost:10000
+    # We choose port 10000 as we have given into docker file for spark-worker
+    Protocol - Standard
+    Data connectivity mode - DirectQuery
+    # We choose directquery as opposed to Import option because, when working with streaming data which is subject to \
+    # change every second we use directquery and when working with batch processing where whole data is usually \
+    # already there we use import to basically import a file to work with
+
+40. Then we need to choose our views, so we reach to Navigate page
+
+    In that page, there are views and tables as well, if choose tables we cant access them and they are blocked, \
+    so choose views
+
+    Select all 3 views that we created and click Load
+
+    This will open dashboard where we can see our data from tables which are imported through views
+
+41. Now these tables belongs to star schema so our 2 dimension tables should be connected to 1 fact table
+
+    So to establish the star schema connection into power-bi, click on model view on left pane
+
+    if power-bi sees common columns from tables it automatically connects dim and fact tables to give star schema \
+    model of our tables
+
+42. If its not automatically connected, then we can connect it using creating links in between them
+
+    So to connect manually pick common columns and connect between them:
+    i.e. city_zone column is in both so drag city_zone from dim to city_zone in fact, similarly we connect dim_road to \
+    fact table as well through road_id column
+
+    Choose cardinality - one to many
+    One for dimension table and many for fact table
+
+43. Now we get to dashboard where we can join different columns from different fact and dimension tables by selecting \
+    from right pane from "Data"
+
+
+
