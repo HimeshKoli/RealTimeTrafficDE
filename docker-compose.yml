@@ -42,9 +42,6 @@ services:
     container_name: spark-master
     hostname: spark-master
     command: >
-    # Below we actually give in container itself how much cores and memory our worker can use
-    # We can here itself add more workers as well, for parallel execution we can keep 3 workers, one for each layer \
-    # i.e 1 for bronze, 1 for silver and 1 for gold
       bash -c "
       /opt/spark/sbin/start-master.sh &&
       tail -f /opt/spark/logs/spark--org.apache.spark.deploy.master*.out
@@ -66,6 +63,9 @@ services:
     container_name: spark-worker
     hostname: spark-worker
     command: >
+    # Below we actually give in container itself how much cores and memory our worker can use
+    # We can here itself add more workers as well, for parallel execution we can keep 3 workers, one for each layer \
+    # i.e 1 for bronze, 1 for silver and 1 for gold
       bash -c "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 --cores 2 --memory 2g &&
       tail -f /opt/spark/logs/spark--org.apache.spark.deploy.worker*.out"
     ports:
